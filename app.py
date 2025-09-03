@@ -1,5 +1,6 @@
 # app_mbg_projection.py
 # MBG Projection — Streamlit app with "ipynb parity" mode
+# Frontend displays numbers with 0 decimals (metrics, table, chart axes).
 
 import io
 import math
@@ -9,10 +10,11 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
+import altair as alt
 from scipy.optimize import curve_fit
 
 # =========================
-# Helpers: normalization
+# Helpers: normalization & formatting
 # =========================
 def _dedup_columns(cols: List[str]) -> List[str]:
     """Ensure column labels are unique by suffixing duplicates with .1, .2, ..."""
@@ -97,6 +99,30 @@ def _canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     base = [c for c in keep if c in df.columns]
     extras = [c for c in df.columns if c not in base]
     return df[base + extras]
+
+# --- formatting helpers (0 decimals everywhere) ---
+def fmt0_en(x) -> str:
+    """1,234,567 with 0 decimals (en-style separators)"""
+    try:
+        return f"{float(x):,.0f}"
+    except Exception:
+        return "—"
+
+def fmt0_id(x) -> str:
+    """1.234.567 with 0 decimals (ID-style separators)"""
+    try:
+        return f"{float(x):,.0f}".replace(",", ".")
+    except Exception:
+        return "—"
+
+def df_to_display_strings(df: pd.DataFrame, id_style: bool = True) -> pd.DataFrame:
+    """Convert numeric columns to strings with thousand separators, no decimals."""
+    out = df.copy()
+    fmt = fmt0_id if id_style else fmt0_en
+    for c in out.columns:
+        if pd.api.types.is_numeric_dtype(out[c]):
+            out[c] = out[c].map(lambda v: fmt(v) if pd.notna(v) else "—")
+    return out
 
 # =========================
 # Model functions
@@ -258,8 +284,7 @@ def build_projection(
         # Parity mode: flat Sep–Dec = rounded last observed
         if parity_mode:
             last_avg_flat = float(int(round(hist[-1] if len(hist) else 0.0)))
-            avg = avg.fillna(method="ffill")
-            avg = avg.fillna(last_avg_flat)
+            avg = avg.fillna(method="ffill").fillna(last_avg_flat)
             avg.loc[res["t"] >= 9] = last_avg_flat
         else:
             if avg_rule == "linear_trend" and len(hist) >= 2:
@@ -308,10 +333,9 @@ def build_projection(
         out = pd.DataFrame({
             "month": res["month"],
             "t": res["t"],
-            # Display penyalur rounded (ipynb table showed rounded, but calculation used float)
+            # Display penyalur rounded (calc used float)
             "penyalur": np.round(penyalur_float, 0),
-            # Show avg as-is (Sep–Dec will be integer in parity mode)
-            "avg_per_penyalur": avg,
+            "avg_per_penyalur": np.round(avg, 0),  # show 0 decimals
             "realisasi": np.round(realisasi_adj, 0),
             "cumulative_realisasi": np.round(cum_adj, 0),
             "pagu": float(pagu_cap),
@@ -385,7 +409,7 @@ with st.sidebar:
             r_opt = st.slider("Optimistis: multiplier r", 0.5, 4.0, 2.0, 0.1)
             t0_opt = st.slider("Optimistis: multiplier t0", 0.5, 1.5, 1.30, 0.05)
 
-# Diagnostics
+# Diagnostics (optional)
 df_canon = _canonicalize_columns(df_loaded)
 with st.expander("🔍 Diagnostik Kolom (klik untuk melihat)", expanded=False):
     st.write(list(df_canon.columns))
@@ -396,7 +420,7 @@ sep_penyalur = None if in_sep_penyalur_val == 0 else float(in_sep_penyalur_val)
 sep_avg = None if in_sep_avg_val == 0 else float(in_sep_avg_val)
 sep_real = None if in_sep_real_override_val == 0 else float(in_sep_real_override_val)
 
-# Scenario multipliers (ipynb used multipliers only on penyalur params; keep same interface)
+# Scenario multipliers
 scen_multipliers = {
     "conservative": (1.0, 1.0, 1.0),
     "moderate": (K_mod if not parity_mode else 1.5, r_mod if not parity_mode else 1.5, t0_mod if not parity_mode else 1.25),
@@ -420,7 +444,7 @@ with st.spinner("Menghitung proyeksi..."):
         parity_mode=parity_mode,
     )
 
-# KPIs
+# KPIs (0 decimals, ID separators)
 col1, col2, col3 = st.columns(3)
 for scen, df_out in results.items():
     total = float(df_out["realisasi"].sum())
@@ -428,8 +452,8 @@ for scen, df_out in results.items():
     hit = cap_hits.get(scen)
     label = f"**{scen.title()}**"
     with (col1 if scen == "conservative" else col2 if scen == "moderate" else col3):
-        st.metric(f"{label} • Total Realisasi (Rp)", f"{total:,.0f}")
-        st.metric("Sisa Pagu (Rp)", f"{sisa:,.0f}")
+        st.metric(f"{label} • Total Realisasi (Rp)", fmt0_id(total))
+        st.metric("Sisa Pagu (Rp)", fmt0_id(sisa))
         st.metric("Bulan Pagu Habis", f"{hit}" if hit else "—")
 
 st.markdown("---")
@@ -439,13 +463,16 @@ tab1, tab2, tab3 = st.tabs(["📊 Tabel", "📈 Kumulatif vs Pagu", "📉 Penyal
 
 with tab1:
     scen_choice = st.selectbox("Pilih skenario untuk ditampilkan:", options=list(results.keys()), index=0)
-    st.dataframe(results[scen_choice])
+    df_show = results[scen_choice].copy()
+    # Rename avg column for readability
+    df_show = df_show.rename(columns={"avg_per_penyalur": "average_spending_per_penyalur"})
+    # Display with 0-decimal strings (avoids scientific notation)
+    st.dataframe(df_to_display_strings(df_show), use_container_width=True)
 
-    # Download Excel with all scenarios
+    # Download Excel with all scenarios (keep numerics inside file)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         for scen, df_out in results.items():
-            # Make avg column round(2) for readability; keep raw numbers for calc elsewhere
             df_save = df_out.copy()
             df_save["average_spending_per_penyalur"] = df_save.pop("avg_per_penyalur")
             df_save.to_excel(writer, sheet_name=scen, index=False)
@@ -457,13 +484,24 @@ with tab1:
     )
 
 with tab2:
+    # Altair chart with 0-decimal axis (US commas on axis)
+    # (Axis uses ",.0f"; table & metrics use ID-style dots.)
     chart_df = None
     for scen, df_out in results.items():
         tmp = df_out[["month", "cumulative_realisasi"]].copy()
         tmp = tmp.rename(columns={"cumulative_realisasi": f"{scen}_cum"})
         chart_df = tmp if chart_df is None else chart_df.merge(tmp, on="month", how="outer")
     chart_df = chart_df.sort_values("month")
-    st.line_chart(chart_df.set_index("month"))
+    base = alt.Chart(chart_df).transform_fold(
+        fold=[c for c in chart_df.columns if c.endswith("_cum")],
+        as_=["scenario", "value"]
+    )
+    ch = base.mark_line().encode(
+        x=alt.X("month:N", title="Bulan"),
+        y=alt.Y("value:Q", title="Kumulatif Realisasi (Rp)", axis=alt.Axis(format=",.0f")),
+        color=alt.Color("scenario:N", title="Skenario")
+    )
+    st.altair_chart(ch, use_container_width=True)
 
 with tab3:
     chart_df2 = None
@@ -472,9 +510,32 @@ with tab3:
         tmp = tmp.rename(columns={"penyalur": f"{scen}_penyalur", "avg_per_penyalur": f"{scen}_avg"})
         chart_df2 = tmp if chart_df2 is None else chart_df2.merge(tmp, on="month", how="outer")
     chart_df2 = chart_df2.sort_values("month")
-    st.line_chart(chart_df2.set_index("month"))
+
+    # Penyalur chart
+    base2 = alt.Chart(chart_df2).transform_fold(
+        fold=[c for c in chart_df2.columns if c.endswith("_penyalur")],
+        as_=["scenario", "value"]
+    )
+    ch2 = base2.mark_line().encode(
+        x=alt.X("month:N", title="Bulan"),
+        y=alt.Y("value:Q", title="Penyalur", axis=alt.Axis(format=",.0f")),
+        color=alt.Color("scenario:N", title="Skenario")
+    )
+    st.altair_chart(ch2, use_container_width=True)
+
+    # Avg per penyalur chart
+    base3 = alt.Chart(chart_df2).transform_fold(
+        fold=[c for c in chart_df2.columns if c.endswith("_avg")],
+        as_=["scenario", "value"]
+    )
+    ch3 = base3.mark_line().encode(
+        x=alt.X("month:N", title="Bulan"),
+        y=alt.Y("value:Q", title="Rata-rata per Penyalur (Rp)", axis=alt.Axis(format=",.0f")),
+        color=alt.Color("scenario:N", title="Skenario")
+    )
+    st.altair_chart(ch3, use_container_width=True)
 
 st.caption(
-    "Parity ON: unbounded logistic fit, Sep–Dec flat average (rounded last observed), zero-after-cap — matches ipynb. "
-    "Parity OFF: use bounded fit + chosen average rule/trend, optional 'pukul rata', and your chosen cap policy."
+    "Parity ON: unbounded logistic fit, Sep–Dec flat average (rounded last observed), zero-after-cap — cocok dengan ipynb. "
+    "Tampilan frontend tanpa desimal. Di tabel, pemisah ribuan memakai titik. Di sumbu grafik, tidak ada desimal (format US)."
 )
